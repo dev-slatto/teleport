@@ -733,7 +733,6 @@ func (s *WindowsService) connectRDP(ctx context.Context, log logrus.FieldLogger,
 			services.NewWindowsLoginMatcher(login))
 	}
 
-	delay := timer()
 	// Use a context that is canceled when we're done handling
 	// this connection. This ensures that the connection monitor
 	// will stop checking for idle activity when the connection
@@ -741,6 +740,7 @@ func (s *WindowsService) connectRDP(ctx context.Context, log logrus.FieldLogger,
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	delay := timer()
 	tdpConn := tdp.NewConn(proxyConn)
 	sessionStartTime := s.cfg.Clock.Now().UTC().Round(time.Millisecond)
 	tdpConn.OnSend = func(m tdp.Message, b []byte) {
@@ -905,7 +905,7 @@ func (s *WindowsService) nameForStaticHost(addr string) (string, error) {
 	return prefix + "-static-" + strings.ReplaceAll(host, ".", "-"), nil
 }
 
-// timer returns a closer that on each call returns the
+// timer returns a closure that on each call returns the
 // number of milliseconds that have elapsed since the first call.
 // it returns 0 on the very first call.
 func timer() func() int64 {

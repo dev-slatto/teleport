@@ -63,13 +63,14 @@ func (s *WindowsService) onSessionStart(ctx context.Context, id *tlsca.Identity,
 }
 
 func (s *WindowsService) onSessionEnd(ctx context.Context, id *tlsca.Identity, startedAt time.Time, recorded bool, windowsUser, sessionID string, desktop types.WindowsDesktop) {
+	userData := id.GetUserMetadata()
 	event := &events.WindowsDesktopSessionEnd{
 		Metadata: events.Metadata{
 			Type:        libevents.WindowsDesktopSessionEndEvent,
 			Code:        libevents.DesktopSessionEndCode,
 			ClusterName: s.clusterName,
 		},
-		UserMetadata: id.GetUserMetadata(),
+		UserMetadata: userData,
 		SessionMetadata: events.SessionMetadata{
 			SessionID: sessionID,
 			WithMFA:   id.MFAVerified,
@@ -83,6 +84,9 @@ func (s *WindowsService) onSessionEnd(ctx context.Context, id *tlsca.Identity, s
 		EndTime:               s.cfg.Clock.Now().UTC().Round(time.Millisecond),
 		DesktopName:           desktop.GetName(),
 		Recorded:              recorded,
+
+		// There can only be 1 participant, desktop sessions are not join-able.
+		Participants: []string{userData.User},
 	}
 	s.emit(ctx, event)
 }
