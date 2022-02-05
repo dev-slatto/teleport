@@ -83,10 +83,7 @@ func TestSessionStartEvent(t *testing.T) {
 			Code:        libevents.DesktopSessionStartCode,
 			Time:        s.cfg.Clock.Now().UTC().Round(time.Millisecond),
 		},
-		UserMetadata: events.UserMetadata{
-			User:         id.Username,
-			Impersonator: id.Impersonator,
-		},
+		UserMetadata: id.GetUserMetadata(),
 		SessionMetadata: events.SessionMetadata{
 			SessionID: "sessionID",
 			WithMFA:   id.MFAVerified,
@@ -193,11 +190,7 @@ func TestSessionEndEvent(t *testing.T) {
 			Type:        libevents.WindowsDesktopSessionEndEvent,
 			Code:        libevents.DesktopSessionEndCode,
 		},
-		UserMetadata: events.UserMetadata{
-			User:         id.Username,
-			Impersonator: id.Impersonator,
-			Login:        "Administrator",
-		},
+		UserMetadata: id.GetUserMetadata(),
 		SessionMetadata: events.SessionMetadata{
 			SessionID: "sessionID",
 			WithMFA:   id.MFAVerified,

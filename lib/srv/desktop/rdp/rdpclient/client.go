@@ -52,13 +52,13 @@ package rdpclient
 
 /*
 // Flags to include the static Rust library.
-#cgo linux,386 LDFLAGS: -L${SRCDIR}/target/i686-unknown-linux-gnu/release
-#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/target/x86_64-unknown-linux-gnu/release
-#cgo linux,arm LDFLAGS: -L${SRCDIR}/target/arm-unknown-linux-gnueabihf/release
-#cgo linux,arm64 LDFLAGS: -L${SRCDIR}/target/aarch64-unknown-linux-gnu/release
+#cgo linux,386 LDFLAGS: -L${SRCDIR}/../../../../../target/i686-unknown-linux-gnu/release
+#cgo linux,amd64 LDFLAGS: -L${SRCDIR}/../../../../../target/x86_64-unknown-linux-gnu/release
+#cgo linux,arm LDFLAGS: -L${SRCDIR}/../../../../../target/arm-unknown-linux-gnueabihf/release
+#cgo linux,arm64 LDFLAGS: -L${SRCDIR}/../../../../../target/aarch64-unknown-linux-gnu/release
 #cgo linux LDFLAGS: -l:librdp_client.a -lpthread -ldl -lm
-#cgo darwin,amd64 LDFLAGS: -L${SRCDIR}/target/x86_64-apple-darwin/release
-#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/target/aarch64-apple-darwin/release
+#cgo darwin,amd64 LDFLAGS: -L${SRCDIR}/../../../../../target/x86_64-apple-darwin/release
+#cgo darwin,arm64 LDFLAGS: -L${SRCDIR}/../../../../../target/aarch64-apple-darwin/release
 #cgo darwin LDFLAGS: -framework CoreFoundation -framework Security -lrdp_client -lpthread -ldl -lm
 #include <librdprs.h>
 */
@@ -87,7 +87,7 @@ func init() {
 	// on the logrus log level
 	// (unless RUST_LOG is already explicitly set, then we
 	// assume the user knows what they want)
-	if rl := os.Getenv("RUST_LOG"); rl != "" {
+	if rl := os.Getenv("RUST_LOG"); rl == "" {
 		var rustLogLevel string
 		switch l := logrus.GetLevel(); l {
 		case logrus.TraceLevel:
@@ -161,7 +161,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 
 func (c *Client) readClientUsername() error {
 	for {
-		msg, err := c.cfg.InputMessage()
+		msg, err := c.cfg.Conn.InputMessage()
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -178,7 +178,7 @@ func (c *Client) readClientUsername() error {
 
 func (c *Client) readClientSize() error {
 	for {
-		msg, err := c.cfg.InputMessage()
+		msg, err := c.cfg.Conn.InputMessage()
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -195,7 +195,7 @@ func (c *Client) readClientSize() error {
 }
 
 func (c *Client) connect(ctx context.Context) error {
-	userCertDER, userKeyDER, err := c.cfg.GenerateUserCert(ctx, c.username)
+	userCertDER, userKeyDER, err := c.cfg.GenerateUserCert(ctx, c.username, c.cfg.CertTTL)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -256,12 +256,11 @@ func (c *Client) start() {
 		// Remember mouse coordinates to send them with all CGOPointer events.
 		var mouseX, mouseY uint32
 		for {
-			msg, err := c.cfg.InputMessage()
+			msg, err := c.cfg.Conn.InputMessage()
 			if err == io.EOF {
-				c.cfg.Log.Debugln("Received EOF, TDP connection closed by user/proxy")
+				c.cfg.Log.Infoln("Received EOF, TDP connection closed by user/proxy")
 				return
-			}
-			if err != nil {
+			} else if err != nil {
 				c.cfg.Log.Warningf("Failed reading TDP input message: %v", err)
 				return
 			}
@@ -388,7 +387,7 @@ func (c *Client) handleBitmap(cb C.CGOBitmap) C.CGOError {
 	})
 	copy(img.Pix, data)
 
-	if err := c.cfg.OutputMessage(tdp.PNGFrame{Img: img}); err != nil {
+	if err := c.cfg.Conn.OutputMessage(tdp.NewPNG(img, c.cfg.Encoder)); err != nil {
 		return C.CString(fmt.Sprintf("failed to send PNG frame %v: %v", img.Rect, err))
 	}
 	return nil

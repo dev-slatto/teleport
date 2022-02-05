@@ -31,6 +31,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-ldap/ldap/v3"
@@ -49,6 +50,7 @@ import (
 	libevents "github.com/gravitational/teleport/lib/events"
 	"github.com/gravitational/teleport/lib/events/filesessions"
 	"github.com/gravitational/teleport/lib/limiter"
+	"github.com/gravitational/teleport/lib/modules"
 	"github.com/gravitational/teleport/lib/services"
 	"github.com/gravitational/teleport/lib/session"
 	"github.com/gravitational/teleport/lib/srv"
@@ -67,6 +69,13 @@ const (
 	// deliberately set to a small value to give enough time to establish a
 	// single desktop session.
 	windowsDesktopCertTTL = 5 * time.Minute
+
+	// windowsDesktopServiceCertTTL is the TTL for certificates issued to the
+	// Windows Desktop Service in order to authenticate with the LDAP server.
+	// It is set longer than the Windows certificates for users because it is
+	// not used for interactive login and is only used when issuing certs for
+	// a restrictive service account.
+	windowsDesktopServiceCertTTL = 8 * time.Hour
 )
 
 // WindowsService implements the RDP-based Windows desktop access service.
@@ -80,7 +89,8 @@ type WindowsService struct {
 
 	streamer libevents.Streamer
 
-	lc *ldapClient
+	lc              *ldapClient
+	ldapInitialized int32
 
 	// lastDisoveryResults stores the results of the most recent LDAP search
 	// when desktop discovery is enabled
@@ -146,9 +156,6 @@ type LDAPConfig struct {
 	// Username is an LDAP username, like "EXAMPLE\Administrator", where
 	// "EXAMPLE" is the NetBIOS version of Domain.
 	Username string
-	// Password is an LDAP password. Usually it's the same user password used
-	// for local logins on the Domain Controller.
-	Password string
 	// InsecureSkipVerify decides whether whether we skip verifying with the LDAP server's CA when making the LDAPS connection.
 	InsecureSkipVerify bool
 	// CA is an optional CA cert to be used for verification if InsecureSkipVerify is set to false.
@@ -164,9 +171,6 @@ func (cfg LDAPConfig) check() error {
 	}
 	if cfg.Username == "" {
 		return trace.BadParameter("missing Username in LDAPConfig")
-	}
-	if cfg.Password == "" {
-		return trace.BadParameter("missing Password in LDAPConfig")
 	}
 	return nil
 }
@@ -279,14 +283,20 @@ func NewWindowsService(cfg WindowsServiceConfig) (*WindowsService, error) {
 		return nil, trace.Wrap(err)
 	}
 
-	clusterName, err := cfg.AccessPoint.GetClusterName()
-	if err != nil {
-		return nil, trace.Wrap(err, "fetching cluster name: %v", err)
+	// It's possible to provide a CA certificate for the LDAP server
+	// and to skip TLS valdiation, though this may be an error, so try
+	// to warn the user.
+	// (You may need this configuration in order to use certificates to
+	// authenticate with LDAP when the LDAP server name is not correct
+	// in the certificate).
+	if cfg.LDAPConfig.CA != nil && cfg.LDAPConfig.InsecureSkipVerify {
+		cfg.Log.Warn("LDAP configuration specifies both der_ca_file and insecure_skip_verify." +
+			"TLS connections to the LDAP server will not be verified. If this is intentional, disregard this warning.")
 	}
 
-	lc, err := newLDAPClient(cfg.LDAPConfig)
+	clusterName, err := cfg.AccessPoint.GetClusterName()
 	if err != nil {
-		return nil, trace.Wrap(err, "connecting to LDAP server: %v", err)
+		return nil, trace.Wrap(err, "fetching cluster name")
 	}
 
 	// Here we assume the LDAP server is an Active Directory Domain Controller,
@@ -314,11 +324,29 @@ func NewWindowsService(cfg WindowsServiceConfig) (*WindowsService, error) {
 				return d.DialContext(ctx, network, dnsAddr)
 			},
 		},
-		lc:          lc,
+		lc:          &ldapClient{cfg: cfg.LDAPConfig},
 		clusterName: clusterName.GetClusterName(),
 		closeCtx:    ctx,
 		close:       close,
 	}
+
+	// run LDAP initialization in a retry loop - this prevents the service
+	// from crashing and taking the entire Teleport process with it if
+	// we cannot connect to LDAP
+	l, err := utils.NewLinear(utils.LinearConfig{
+		First: 5 * time.Second,
+		Step:  30 * time.Second,
+		Max:   30 * time.Minute,
+		Clock: s.cfg.Clock,
+	})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	go func() {
+		if retryErr := l.For(s.closeCtx, s.initializeLDAP); retryErr != nil {
+			s.cfg.Log.WithError(retryErr).Error("attempting to initialize LDAP client")
+		}
+	}()
 
 	recConfig, err := s.cfg.AccessPoint.GetSessionRecordingConfig(s.closeCtx)
 	if err != nil {
@@ -333,23 +361,6 @@ func NewWindowsService(cfg WindowsServiceConfig) (*WindowsService, error) {
 	}
 	s.streamer = streamer
 
-	// Note: admin still needs to import our CA into the Group Policy following
-	// https://docs.vmware.com/en/VMware-Horizon-7/7.13/horizon-installation/GUID-7966AE16-D98F-430E-A916-391E8EAAFE18.html
-	//
-	// We can find the group policy object via LDAP, but it only contains an
-	// SMB file path with the actual policy. See
-	// https://en.wikipedia.org/wiki/Group_Policy
-	//
-	// In theory, we could update the policy file(s) over SMB following
-	// https://docs.microsoft.com/en-us/previous-versions/windows/desktop/policy/registry-policy-file-format,
-	// but I'm leaving this for later.
-	//
-	// TODO(zmb3): do these periodically
-	if err := s.updateCA(ctx); err != nil {
-		s.Close()
-		return nil, trace.Wrap(err)
-	}
-
 	if err := s.startServiceHeartbeat(); err != nil {
 		s.Close()
 		return nil, trace.Wrap(err)
@@ -361,7 +372,7 @@ func NewWindowsService(cfg WindowsServiceConfig) (*WindowsService, error) {
 	}
 
 	if len(s.cfg.DiscoveryBaseDN) > 0 {
-		if err := s.startDesktopDiscovery(ctx); err != nil {
+		if err := s.startDesktopDiscovery(); err != nil {
 			s.Close()
 			return nil, trace.Wrap(err)
 		}
@@ -392,8 +403,6 @@ func (s *WindowsService) newStreamWriter(recConfig types.SessionRecordingConfig,
 // Synchronous streamers send events directly to the auth server, and blocks if the server
 // cannot keep up. Asynchronous streamers buffers the events to disk and uploads them later.
 func (s *WindowsService) newStreamer(ctx context.Context, recConfig types.SessionRecordingConfig) (libevents.Streamer, error) {
-	// TODO(zmb3): determine whether we should even support sync
-	// (it may be that the volume of desktop recordings is too high)
 	if services.IsRecordSync(recConfig.GetMode()) {
 		s.cfg.Log.Debugf("using sync streamer (for mode %v)", recConfig.GetMode())
 		return s.cfg.AuthClient, nil
@@ -419,6 +428,98 @@ func (s *WindowsService) newStreamer(ctx context.Context, recConfig types.Sessio
 	}
 
 	return libevents.NewTeeStreamer(fileStreamer, s.cfg.Emitter), nil
+}
+
+func (s *WindowsService) tlsConfigForLDAP() (*tls.Config, error) {
+	// trim NETBIOS name from username
+	user := s.cfg.Username
+	if i := strings.LastIndex(s.cfg.Username, `\`); i != -1 {
+		user = user[i+1:]
+	}
+
+	certDER, keyDER, err := s.generateCredentials(s.closeCtx, user, s.cfg.Domain, windowsDesktopServiceCertTTL)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	cert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return nil, trace.Wrap(err, "parsing cert DER")
+	}
+
+	key, err := x509.ParsePKCS1PrivateKey(keyDER)
+	if err != nil {
+		return nil, trace.Wrap(err, "parsing key DER")
+	}
+
+	tc := &tls.Config{
+		Certificates: []tls.Certificate{
+			{
+				Certificate: [][]byte{cert.Raw},
+				PrivateKey:  key,
+			},
+		},
+		InsecureSkipVerify: s.cfg.InsecureSkipVerify,
+	}
+
+	if s.cfg.CA != nil {
+		pool := x509.NewCertPool()
+		pool.AddCert(s.cfg.CA)
+		tc.RootCAs = pool
+	}
+
+	return tc, nil
+}
+
+func (s *WindowsService) initializeLDAP() error {
+	tc, err := s.tlsConfigForLDAP()
+	if trace.IsAccessDenied(err) && modules.GetModules().BuildType() == modules.BuildEnterprise {
+		s.cfg.Log.Warn("Could not generate certificate for LDAPS. Ensure that the auth server is licensed for desktop access.")
+	}
+	if err != nil {
+		atomic.StoreInt32(&s.ldapInitialized, 0)
+		return trace.Wrap(err)
+	}
+
+	conn, err := ldap.DialURL("ldaps://"+s.cfg.Addr, ldap.DialWithTLSConfig(tc))
+	if err != nil {
+		atomic.StoreInt32(&s.ldapInitialized, 0)
+		return trace.Wrap(err, "dial")
+	}
+
+	s.lc.setClient(conn)
+
+	// Note: admin still needs to import our CA into the Group Policy following
+	// https://docs.vmware.com/en/VMware-Horizon-7/7.13/horizon-installation/GUID-7966AE16-D98F-430E-A916-391E8EAAFE18.html
+	//
+	// We can find the group policy object via LDAP, but it only contains an
+	// SMB file path with the actual policy. See
+	// https://en.wikipedia.org/wiki/Group_Policy
+	//
+	// In theory, we could update the policy file(s) over SMB following
+	// https://docs.microsoft.com/en-us/previous-versions/windows/desktop/policy/registry-policy-file-format,
+	// but I'm leaving this for later.
+	//
+	if err := s.updateCA(s.closeCtx); err != nil {
+		return trace.Wrap(err)
+	}
+
+	atomic.StoreInt32(&s.ldapInitialized, 1)
+
+	// if we were successful in initializing the client, schedule a renewal
+	// so that we get a new cert prior to expiration
+	go func() {
+		select {
+		case <-time.After(windowsDesktopServiceCertTTL / 3):
+			if err := s.initializeLDAP(); err != nil {
+				s.cfg.Log.WithError(err).Error("couldn't renew certificate for LDAP auth")
+			}
+		case <-s.closeCtx.Done():
+			return
+		}
+	}()
+
+	return nil
 }
 
 func (s *WindowsService) startServiceHeartbeat() error {
@@ -530,6 +631,14 @@ func (s *WindowsService) handleConnection(proxyConn *tls.Conn) {
 		}
 	}
 
+	// don't handle connections until the LDAP initialization retry loop has succeeded
+	// (it would fail anyway, but this presents a better error to the user)
+	if atomic.LoadInt32(&s.ldapInitialized) != 1 {
+		// TODO(zmb3): send TDP error message
+		log.Error("This service cannot accept connections until LDAP initialization has completed.")
+		return
+	}
+
 	// Check connection limits.
 	remoteAddr, _, err := net.SplitHostPort(proxyConn.RemoteAddr().String())
 	if err != nil {
@@ -625,6 +734,13 @@ func (s *WindowsService) connectRDP(ctx context.Context, log logrus.FieldLogger,
 	}
 
 	delay := timer()
+	// Use a context that is canceled when we're done handling
+	// this connection. This ensures that the connection monitor
+	// will stop checking for idle activity when the connection
+	// is closed.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	tdpConn := tdp.NewConn(proxyConn)
 	sessionStartTime := s.cfg.Clock.Now().UTC().Round(time.Millisecond)
 	tdpConn.OnSend = func(m tdp.Message, b []byte) {
@@ -665,13 +781,13 @@ func (s *WindowsService) connectRDP(ctx context.Context, log logrus.FieldLogger,
 	}
 	rdpc, err := rdpclient.New(ctx, rdpclient.Config{
 		Log: log,
-		GenerateUserCert: func(ctx context.Context, username string) (certDER, keyDER []byte, err error) {
-			return s.generateCredentials(ctx, username, desktop.GetDomain())
+		GenerateUserCert: func(ctx context.Context, username string, ttl time.Duration) (certDER, keyDER []byte, err error) {
+			return s.generateCredentials(ctx, username, desktop.GetDomain(), ttl)
 		},
-		Addr:          desktop.GetAddr(),
-		InputMessage:  tdpConn.InputMessage,
-		OutputMessage: tdpConn.OutputMessage,
-		AuthorizeFn:   authorize,
+		CertTTL:     windowsDesktopCertTTL,
+		Addr:        desktop.GetAddr(),
+		Conn:        tdpConn,
+		AuthorizeFn: authorize,
 	})
 	if err != nil {
 		s.onSessionStart(ctx, &identity, sessionStartTime, windowsUser, string(sessionID), desktop, err)
@@ -850,7 +966,19 @@ func (s *WindowsService) updateCA(ctx context.Context) error {
 // CAs that are eligible to issue smart card login certificates and perform client
 // private key archival.
 //
-// This is equivalent to running `certutil –dspublish –f <PathToCertFile.cer> NTAuthCA`
+// This function is equivalent to running:
+//     certutil –dspublish –f <PathToCertFile.cer> NTAuthCA
+//
+// You can confirm the cert is present by running:
+//     certutil -viewstore "ldap:///CN=NTAuthCertificates,CN=Public Key Services,CN=Services,CN=Configuration,DC=example,DC=com>?caCertificate"
+//
+// Once the CA is published to LDAP, it should eventually sync and be present in the
+// machine's enterprise NTAuth store. You can check that with:
+//     certutil -viewstore -enterprise NTAuth
+//
+// You can expedite the synchronization by running:
+//     certutil -pulse
+//
 func (s *WindowsService) updateCAInNTAuthStore(ctx context.Context, caDER []byte) error {
 	// Check if our CA is already in the store. The LDAP entry for NTAuth store
 	// is constant and it should always exist.
@@ -952,7 +1080,7 @@ func (s *WindowsService) crlContainerDN() string {
 // the regular Teleport user certificate, to meet the requirements of Active
 // Directory. See:
 // https://docs.microsoft.com/en-us/windows/security/identity-protection/smart-cards/smart-card-certificate-requirements-and-enumeration
-func (s *WindowsService) generateCredentials(ctx context.Context, username, domain string) (certDER, keyDER []byte, err error) {
+func (s *WindowsService) generateCredentials(ctx context.Context, username, domain string, ttl time.Duration) (certDER, keyDER []byte, err error) {
 	// Important: rdpclient currently only supports 2048-bit RSA keys.
 	// If you switch the key type here, update handle_general_authentication in
 	// rdp/rdpclient/src/piv.rs accordingly.
@@ -1007,7 +1135,7 @@ func (s *WindowsService) generateCredentials(ctx context.Context, username, doma
 		// domain_controller_addr) will cause Windows to fetch the CRL from any
 		// of its current domain controllers.
 		CRLEndpoint: fmt.Sprintf("ldap:///%s?certificateRevocationList?base?objectClass=cRLDistributionPoint", crlDN),
-		TTL:         proto.Duration(windowsDesktopCertTTL),
+		TTL:         proto.Duration(ttl),
 	})
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
