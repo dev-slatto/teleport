@@ -666,6 +666,10 @@ type AccessChecker interface {
 	// CanPortForward returns true if this RoleSet can forward ports.
 	CanPortForward() bool
 
+	// RecordDesktopSession returns true if a role in the role set has enabled
+	// desktop session recoring.
+	RecordDesktopSession() bool
+
 	// MaybeCanReviewRequests attempts to guess if this RoleSet belongs
 	// to a user who should be submitting access reviews. Because not all rolesets
 	// are derived from statically assigned roles, this may return false positives.

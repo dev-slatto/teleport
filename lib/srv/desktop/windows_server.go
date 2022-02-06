@@ -385,7 +385,7 @@ func NewWindowsService(cfg WindowsServiceConfig) (*WindowsService, error) {
 	return s, nil
 }
 
-func (s *WindowsService) newStreamWriter(recConfig types.SessionRecordingConfig, sessionID string) (libevents.StreamWriter, error) {
+func (s *WindowsService) newStreamWriter(record bool, sessionID string) (libevents.StreamWriter, error) {
 	return libevents.NewAuditWriter(libevents.AuditWriterConfig{
 		Component:    teleport.ComponentWindowsDesktop,
 		Namespace:    apidefaults.Namespace,
@@ -394,8 +394,8 @@ func (s *WindowsService) newStreamWriter(recConfig types.SessionRecordingConfig,
 		ClusterName:  s.clusterName,
 		SessionID:    session.ID(sessionID),
 		Streamer:     s.streamer,
-		ServerID:     s.cfg.Heartbeat.HostUUID,               // TODO(zmb3): is this the service ID or desktop ID?
-		RecordOutput: recConfig.GetMode() != types.RecordOff, // TODO(zmb3) this will eventually depend on user roles, not cluster-wide config
+		ServerID:     s.cfg.Heartbeat.HostUUID, // TODO(zmb3): is this the service ID or desktop ID?
+		RecordOutput: record,
 	})
 }
 
@@ -705,13 +705,23 @@ func (s *WindowsService) connectRDP(ctx context.Context, log logrus.FieldLogger,
 		return trace.Wrap(err)
 	}
 
-	recConfig, err := s.cfg.AccessPoint.GetSessionRecordingConfig(ctx)
-	if err != nil {
-		return trace.Wrap(err)
+	sessionID := session.NewID()
+
+	// in order for the session to be recorded, the cluster's session recording mode must
+	// not be "off" and the user's roles must enable recording
+	recordSession := false
+	if authCtx.Checker.RecordDesktopSession() {
+		recConfig, err := s.cfg.AccessPoint.GetSessionRecordingConfig(ctx)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+
+		recordSession = recConfig.GetMode() != types.RecordOff
+	} else {
+		log.Infof("desktop session %v will not be recorded, user %v's roles disable recording", string(sessionID), authCtx.User.GetName())
 	}
 
-	sessionID := session.NewID()
-	sw, err := s.newStreamWriter(recConfig, string(sessionID))
+	sw, err := s.newStreamWriter(recordSession, string(sessionID))
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -824,9 +834,7 @@ func (s *WindowsService) connectRDP(ctx context.Context, log logrus.FieldLogger,
 
 	s.onSessionStart(ctx, &identity, sessionStartTime, windowsUser, string(sessionID), desktop, nil)
 	err = rdpc.Wait()
-	// TODO(isaiah): use of recConfig for desktop recordings is temporary, this will eventually be determined by RBAC
-	recorded := recConfig.GetMode() != "off"
-	s.onSessionEnd(ctx, &identity, sessionStartTime, recorded, windowsUser, string(sessionID), desktop)
+	s.onSessionEnd(ctx, &identity, sessionStartTime, recordSession, windowsUser, string(sessionID), desktop)
 
 	return trace.Wrap(err)
 }
