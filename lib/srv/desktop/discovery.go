@@ -122,7 +122,15 @@ func (s *WindowsService) getDesktopsFromLDAP() types.ResourcesWithLabels {
 	s.cfg.Log.Debugf("searching for desktops with LDAP filter %v", filter)
 
 	entries, err := s.lc.readWithFilter(s.cfg.DiscoveryBaseDN, filter, computerAttribtes)
-	if err != nil {
+	if trace.IsConnectionProblem(err) {
+		// If the connection was broken, re-initialize the LDAP client so that it's
+		// ready for the next reconcile loop. Return the last known set of desktops
+		// in this case, so that the reconciler doesn't delete the desktops it already
+		// knows about.
+		s.cfg.Log.Info("LDAP connection error when searching for desktops, reinitializing client")
+		s.initializeLDAP()
+		return s.lastDiscoveryResults
+	} else if err != nil {
 		s.cfg.Log.Warnf("could not discover Windows Desktops: %v", err)
 		return nil
 	}
